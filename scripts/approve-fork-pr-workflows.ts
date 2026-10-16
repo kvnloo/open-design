@@ -371,28 +371,33 @@ async function syncForkApprovalSkipComment(
     return;
   }
 
-  const comments = await githubPaginated<IssueComment>(`/repos/${repo}/issues/${prNumber}/comments`);
-  const action = planForkApprovalSkipComment(blockedPaths, comments);
-  switch (action.kind) {
-    case "noop":
-      return;
-    case "create":
-      await github(`/repos/${repo}/issues/${prNumber}/comments`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ body: action.body }),
-      });
-      return;
-    case "update":
-      await github(`/repos/${repo}/issues/comments/${action.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ body: action.body }),
-      });
-      return;
-    case "delete":
-      await github<void>(`/repos/${repo}/issues/comments/${action.id}`, { method: "DELETE" });
-      return;
+  // Comment API failures must never block an otherwise eligible CI approval.
+  try {
+    const comments = await githubPaginated<IssueComment>(`/repos/${repo}/issues/${prNumber}/comments`);
+    const action = planForkApprovalSkipComment(blockedPaths, comments);
+    switch (action.kind) {
+      case "noop":
+        return;
+      case "create":
+        await github(`/repos/${repo}/issues/${prNumber}/comments`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ body: action.body }),
+        });
+        return;
+      case "update":
+        await github(`/repos/${repo}/issues/comments/${action.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ body: action.body }),
+        });
+        return;
+      case "delete":
+        await github<void>(`/repos/${repo}/issues/comments/${action.id}`, { method: "DELETE" });
+        return;
+    }
+  } catch (error) {
+    console.warn(`Could not update the fork workflow approval notice for PR #${prNumber}:`, error);
   }
 }
 
