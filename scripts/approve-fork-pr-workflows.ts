@@ -103,10 +103,22 @@ function isAllowedSourceOrTestPath(path: string): boolean {
   return /^(apps|packages)\/[^/]+\/(src|tests)\//.test(path);
 }
 
+// Only ordinary Markdown content in explicitly reviewed roots is eligible.
+// A directory-wide allow rule would also admit TS, HTML, JSON, and test fixtures.
+function isLowRiskContentMarkdownPath(path: string): boolean {
+  return (
+    /^(craft|design-systems|specs)\//.test(path) &&
+    path.endsWith(".md") &&
+    !/(^|\/)(AGENTS|SKILL)\.md$/.test(path) &&
+    !/(fixture|snapshot|__tests__|\/tests?\/)/i.test(path)
+  );
+}
+
 export function isAllowedChangedPath(path: string): boolean {
   if (isDeniedChangedPath(path)) return false;
   return (
     isDocsPath(path) ||
+    isLowRiskContentMarkdownPath(path) ||
     path.startsWith("apps/web/") ||
     isAllowedSourceOrTestPath(path)
   );
@@ -138,6 +150,69 @@ function isDocsPath(path: string): boolean {
     path === "QUICKSTART.md" ||
     path.startsWith("docs/")
   );
+}
+
+// Keep this feedback on the PR: an auto-approval skip is a maintainer-side
+// policy decision, not a request for the author to push another commit.
+const skipCommentMarker = "<!-- fork-pr-workflow-approval-policy:v1 -->";
+
+type IssueComment = {
+  id: number;
+  body: string | null;
+  user: { login: string } | null;
+};
+
+type SkipCommentAction =
+  | { kind: "noop" }
+  | { kind: "create"; body: string }
+  | { kind: "update"; id: number; body: string }
+  | { kind: "delete"; id: number };
+
+function escapePathForComment(path: string): string {
+  return path
+    .slice(0, 240)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("\r", "\\r")
+    .replaceAll("\n", "\\n");
+}
+
+export function formatForkApprovalSkipComment(blockedPaths: string[]): string {
+  const shown = blockedPaths.slice(0, 10).map((path) => `- <code>${escapePathForComment(path)}</code>`);
+  const more = blockedPaths.length > shown.length ? `\n- …and ${blockedPaths.length - shown.length} more.` : "";
+
+  return `${skipCommentMarker}
+**CI auto-approval skipped (maintainer action needed).**
+
+The fork workflow approver found ${blockedPaths.length} changed path(s) outside its allowlist:
+
+${shown.join("\n")}${more}
+
+This is a repository-side workflow approval decision. **Another push is not required** and will not by itself change the allowlist. A maintainer can review the affected paths and choose whether to approve CI manually.
+
+See the [fork approval policy](https://github.com/nexu-io/open-design/blob/main/scripts/approve-fork-pr-workflows.ts).
+`;
+}
+
+export function planForkApprovalSkipComment(
+  blockedPaths: string[],
+  comments: IssueComment[],
+): SkipCommentAction {
+  // Only edit comments actually authored by this workflow's GitHub Actions bot.
+  const previous = comments.find(
+    (comment) => comment.user?.login === "github-actions[bot]" && comment.body?.startsWith(skipCommentMarker),
+  );
+
+  if (blockedPaths.length === 0) return previous ? { kind: "delete", id: previous.id } : { kind: "noop" };
+  const body = formatForkApprovalSkipComment(blockedPaths);
+  if (!previous) return { kind: "create", body };
+  if (previous.body === body) return { kind: "noop" };
+  return { kind: "update", id: previous.id, body };
+}
+
+export function getBlockedChangedPaths(files: PullRequestFile[]): string[] {
+  return files.flatMap((file) => changedPathSet(file).filter((path) => !isAllowedChangedPath(path)));
 }
 
 function changedPathSet(file: PullRequestFile): string[] {
@@ -286,6 +361,39 @@ async function githubPaginated<T>(path: string): Promise<T[]> {
   }
 }
 
+async function syncForkApprovalSkipComment(
+  repo: string,
+  prNumber: number,
+  blockedPaths: string[],
+): Promise<void> {
+  if (dryRun) {
+    console.log(`[dry-run] would reconcile fork approval skip comment (${blockedPaths.length} blocked paths).`);
+    return;
+  }
+
+  const comments = await githubPaginated<IssueComment>(`/repos/${repo}/issues/${prNumber}/comments`);
+  const action = planForkApprovalSkipComment(blockedPaths, comments);
+  switch (action.kind) {
+    case "noop":
+      return;
+    case "create":
+      await github(`/repos/${repo}/issues/${prNumber}/comments`, {
+        method: "POST",
+        body: JSON.stringify({ body: action.body }),
+      });
+      return;
+    case "update":
+      await github(`/repos/${repo}/issues/comments/${action.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ body: action.body }),
+      });
+      return;
+    case "delete":
+      await github<void>(`/repos/${repo}/issues/comments/${action.id}`, { method: "DELETE" });
+      return;
+  }
+}
+
 async function approveRun(run: WorkflowRun): Promise<void> {
   const repo = getRepo();
 
@@ -403,13 +511,17 @@ async function main(): Promise<void> {
     return;
   }
 
-  const blockedPaths = files.flatMap((file) => changedPathSet(file).filter((path) => !isAllowedChangedPath(path)));
+  const blockedPaths = getBlockedChangedPaths(files);
 
   if (blockedPaths.length > 0) {
     console.log(`Skipping PR #${prNumber}: changed paths are outside the auto-approval allowlist.`);
     for (const path of blockedPaths) console.log(`- ${path}`);
+    await syncForkApprovalSkipComment(repo, prNumber, blockedPaths);
     return;
   }
+
+  // Clear our previous policy-block comment if the current changed paths now qualify.
+  await syncForkApprovalSkipComment(repo, prNumber, []);
 
   const pendingRuns = await waitForPendingApprovalRuns(() => listPendingApprovalRuns(repo, pull, files));
 
