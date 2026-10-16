@@ -379,12 +379,14 @@ async function syncForkApprovalSkipComment(
     case "create":
       await github(`/repos/${repo}/issues/${prNumber}/comments`, {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ body: action.body }),
       });
       return;
     case "update":
       await github(`/repos/${repo}/issues/comments/${action.id}`, {
         method: "PATCH",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ body: action.body }),
       });
       return;
