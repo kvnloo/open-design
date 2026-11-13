@@ -24,7 +24,8 @@ on:
 permissions:
   actions: write
   contents: read
-  pull-requests: read
+  # Trusted base code upserts a policy-block explanation on fork PRs.
+  pull-requests: write
 
 concurrency:
   group: fork-pr-workflow-approval-${{ github.event.pull_request.number || inputs.pr_number }}

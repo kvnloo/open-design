@@ -2,11 +2,14 @@ import assert from "node:assert/strict";
 import { test } from "vitest";
 
 import {
+  formatForkApprovalSkipComment,
+  getBlockedChangedPaths,
   hasPullApprovalStateDrift,
   isAllowedChangedPath,
   isDeniedChangedPath,
   isPendingApprovalRun,
   listPendingApprovalRuns,
+  planForkApprovalSkipComment,
   runTargetsPullRequest,
   waitForPendingApprovalRuns,
 } from "../../../scripts/approve-fork-pr-workflows.ts";
@@ -630,6 +633,81 @@ test("isAllowedChangedPath allows ordinary app and package source/test paths whi
   assert.equal(isAllowedChangedPath("tools/pack/src/index.ts"), false);
   assert.equal(isAllowedChangedPath("apps/packaged/tsconfig.json"), false);
   assert.equal(isAllowedChangedPath("apps/packaged/vitest.config.ts"), false);
+});
+
+test("isAllowedChangedPath admits Markdown-only content roots without expanding executable paths", () => {
+  for (const path of [
+    "craft/accessibility-baseline.md",
+    "design-systems/default/DESIGN.md",
+    "design-systems/apple/USAGE.md",
+    "specs/current/ci.md",
+  ]) assert.equal(isAllowedChangedPath(path), true, path);
+
+  for (const path of [
+    "craft/accessibility-baseline.ts",
+    "design-systems/_schema/manifest.schema.ts",
+    "design-systems/default/components.html",
+    "design-systems/default/manifest.json",
+    "design-systems/default/tokens.css",
+    "design-systems/_schema/AGENTS.md",
+    "specs/current/SKILL.md",
+    "specs/current/__tests__/scenario.md",
+    "specs/current/tests/scenario.md",
+    "specs/current/test/seed.md",
+    "specs/current/fixtures/seed.md",
+    "specs/current/snapshot-report.md",
+    "craft/accessibility-fixture.md",
+    "skills/my-skill/SKILL.md",
+    "plugins/my-plugin/README.md",
+    ".github/workflows/ci.yml",
+    "scripts/approve-fork-pr-workflows.ts",
+  ]) assert.equal(isAllowedChangedPath(path), false, path);
+
+  // Keep the pre-existing broad docs and application-source decisions unchanged.
+  assert.equal(isAllowedChangedPath("docs/guides/readme.md"), true);
+  assert.equal(isAllowedChangedPath("docs/example.json"), true);
+  assert.equal(isAllowedChangedPath("apps/web/src/app/page.tsx"), true);
+});
+
+test("getBlockedChangedPaths evaluates both sides of a rename and blocks mixed changes", () => {
+  assert.deepEqual(getBlockedChangedPaths([
+    { filename: "craft/accessibility-baseline.md", status: "modified" },
+    {
+      filename: "design-systems/default/DESIGN.md",
+      previous_filename: "scripts/unsafe.ts",
+      status: "renamed",
+    },
+    { filename: "specs/current/e2e-snapshot.md", status: "modified" },
+  ]), ["scripts/unsafe.ts", "specs/current/e2e-snapshot.md"]);
+});
+
+test("fork approval skip comment is visible, bounded, and escapes untrusted file names", () => {
+  const body = formatForkApprovalSkipComment(["craft/<script>alert(1)</script>&notes.md", "other/mixed.ts"]);
+  assert.match(body, /maintainer action needed/);
+  assert.match(body, /Another push is not required/);
+  assert.match(body, /2 changed path/);
+  assert.match(body, /&lt;script&gt;alert\(1\)&lt;\/script&gt;&amp;notes.md/);
+  assert.equal(body.includes("<script>"), false);
+
+  const long = formatForkApprovalSkipComment(Array.from({ length: 14 }, (_, index) => `other/path-${index}.ts`));
+  assert.match(long, /and 4 more/);
+  assert.equal(long.includes("path-10.ts"), false);
+});
+
+test("fork approval comments are bot-owned, idempotent, and removed when paths become eligible", () => {
+  const blocked = ["craft/not-markdown.json"];
+  const body = formatForkApprovalSkipComment(blocked);
+  const author = { id: 1, body, user: { login: "contributor" } };
+  const bot = { id: 2, body, user: { login: "github-actions[bot]" } };
+  assert.equal(planForkApprovalSkipComment(blocked, []).kind, "create");
+  assert.equal(planForkApprovalSkipComment(blocked, [author]).kind, "create");
+  assert.deepEqual(planForkApprovalSkipComment(blocked, [bot]), { kind: "noop" });
+  assert.deepEqual(planForkApprovalSkipComment([], [bot]), { kind: "delete", id: 2 });
+
+  const modified = planForkApprovalSkipComment(["specs/current/fixture.md"], [bot]);
+  assert.equal(modified.kind, "update");
+  if (modified.kind === "update") assert.equal(modified.id, 2);
+  assert.deepEqual(planForkApprovalSkipComment([], []), { kind: "noop" });
 });
 
 test("waitForPendingApprovalRuns retries until action_required runs appear and keeps polling through the retry window", async () => {
